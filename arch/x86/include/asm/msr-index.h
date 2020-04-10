@@ -413,9 +413,9 @@
 #define HWP_MAX_PERF(x) 		((x & 0xff) << 8)
 #define HWP_DESIRED_PERF(x)		((x & 0xff) << 16)
 #define HWP_ENERGY_PERF_PREFERENCE(x)	(((unsigned long long) x & 0xff) << 24)
-#define HWP_EPP_PERFORMANCE		0x00
+#define HWP_EPP_PERFORMANCE		0x20
 #define HWP_EPP_BALANCE_PERFORMANCE	0x80
-#define HWP_EPP_BALANCE_POWERSAVE	0xC0
+#define HWP_EPP_BALANCE_POWERSAVE	0xA0
 #define HWP_EPP_POWERSAVE		0xFF
 #define HWP_ACTIVITY_WINDOW(x)		((unsigned long long)(x & 0xff3) << 32)
 #define HWP_PACKAGE_CONTROL(x)		((unsigned long long)(x & 0x1) << 42)
