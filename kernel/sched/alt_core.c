@@ -6681,6 +6681,7 @@ void __init init_idle(struct task_struct *idle, int cpu)
 
 	rq->idle = idle;
 	rcu_assign_pointer(rq->curr, idle);
+	idle->on_rq = TASK_ON_RQ_QUEUED;
 	idle->on_cpu = 1;
 
 	raw_spin_unlock(&rq->lock);
