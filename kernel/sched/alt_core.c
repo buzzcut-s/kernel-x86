@@ -1985,7 +1985,7 @@ static inline int select_task_rq(struct task_struct *p)
 #endif
 	    sched_rq_watermark_and(&tmp, &chk_mask, 0, false) ||
 	    sched_rq_watermark_and(&tmp, &chk_mask,
-			SCHED_BITS - task_sched_prio(p), false))
+			SCHED_BITS - task_sched_prio(p) - 1, false))
 		return best_mask_cpu(task_cpu(p), &tmp);
 
 	return best_mask_cpu(task_cpu(p), &chk_mask);
