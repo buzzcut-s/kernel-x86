@@ -287,7 +287,9 @@ static void sugov_iowait_apply(struct sugov_cpu *sg_cpu, u64 time)
 	 * into the same scale so we can compare.
 	 */
 	boost = (sg_cpu->iowait_boost * sg_cpu->max) >> SCHED_CAPACITY_SHIFT;
+#ifndef CONFIG_SCHED_ALT
 	boost = uclamp_rq_util_with(cpu_rq(sg_cpu->cpu), boost, NULL);
+#endif
 	if (sg_cpu->util < boost)
 		sg_cpu->util = boost;
 }
