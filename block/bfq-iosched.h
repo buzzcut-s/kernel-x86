@@ -901,7 +901,7 @@ struct bfq_group {
 	/* bfq_queues under this entity */
 	struct hlist_head children;
 
-	void *bfqd;
+	struct bfq_data *bfqd;
 
 	struct bfq_queue *async_bfqq[2][IOPRIO_NR_LEVELS];
 	struct bfq_queue *async_idle_bfqq;
