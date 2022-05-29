@@ -224,7 +224,7 @@ void bfqg_stats_update_io_add(struct bfq_group *bfqg, struct bfq_queue *bfqq,
 {
 	blkg_rwstat_add(&bfqg->stats.queued, op, 1);
 	bfqg_stats_end_empty_time(&bfqg->stats);
-	if (!(bfqq == ((struct bfq_data *)bfqg->bfqd)->in_service_queue))
+	if (!(bfqq == bfqg->bfqd->in_service_queue))
 		bfqg_stats_set_start_group_wait_time(bfqg, bfqq_group(bfqq));
 }
 
@@ -557,6 +557,8 @@ static void bfq_pd_init(struct blkg_policy_data *pd)
 				   */
 	bfqg->bfqd = bfqd;
 	bfqg->active_entities = 0;
+	bfqg->busy_queues = 0;
+	bfqg->online = true;
 	bfqg->rq_pos_tree = RB_ROOT;
 }
 
@@ -585,27 +587,10 @@ static void bfq_group_set_parent(struct bfq_group *bfqg,
 	entity->sched_data = &parent->sched_data;
 }
 
-static struct bfq_group *bfq_lookup_bfqg(struct bfq_data *bfqd,
-					 struct blkcg *blkcg)
+static void bfq_link_bfqg(struct bfq_data *bfqd, struct bfq_group *bfqg)
 {
-	struct blkcg_gq *blkg;
-
-	blkg = blkg_lookup(blkcg, bfqd->queue);
-	if (likely(blkg))
-		return blkg_to_bfqg(blkg);
-	return NULL;
-}
-
-struct bfq_group *bfq_find_set_group(struct bfq_data *bfqd,
-				     struct blkcg *blkcg)
-{
-	struct bfq_group *bfqg, *parent;
+	struct bfq_group *parent;
 	struct bfq_entity *entity;
-
-	bfqg = bfq_lookup_bfqg(bfqd, blkcg);
-
-	if (unlikely(!bfqg))
-		return NULL;
 
 	/*
 	 * Update chain of bfq_groups as we might be handling a leaf group
@@ -623,8 +608,24 @@ struct bfq_group *bfq_find_set_group(struct bfq_data *bfqd,
 			bfq_group_set_parent(curr_bfqg, parent);
 		}
 	}
+}
 
-	return bfqg;
+struct bfq_group *bfq_bio_bfqg(struct bfq_data *bfqd, struct bio *bio)
+{
+	struct blkcg_gq *blkg = bio->bi_blkg;
+	struct bfq_group *bfqg;
+
+	while (blkg) {
+		bfqg = blkg_to_bfqg(blkg);
+		if (bfqg->online) {
+			bio_associate_blkg_from_css(bio, &blkg->blkcg->css);
+			return bfqg;
+		}
+		blkg = blkg->parent;
+	}
+	bio_associate_blkg_from_css(bio,
+				&bfqg_to_blkg(bfqd->root_group)->blkcg->css);
+	return bfqd->root_group;
 }
 
 /**
@@ -680,6 +681,7 @@ void bfq_bfqq_move(struct bfq_data *bfqd, struct bfq_queue *bfqq,
 		bfq_deactivate_bfqq(bfqd, bfqq, false, false);
 	else if (entity->on_st_or_in_serv)
 		bfq_put_idle_entity(bfq_entity_service_tree(entity), entity);
+	hlist_del(&bfqq->children_node);
 	bfqg_and_blkg_put(old_parent);
 
 	if (entity->parent &&
@@ -692,6 +694,7 @@ void bfq_bfqq_move(struct bfq_data *bfqd, struct bfq_queue *bfqq,
 	entity->sched_data = &bfqg->sched_data;
 	/* pin down bfqg and its associated blkg  */
 	bfqg_and_blkg_get(bfqg);
+	hlist_add_head(&bfqq->children_node, &bfqg->children);
 
 	if (bfq_bfqq_busy(bfqq)) {
 		if (unlikely(!bfqd->nonrot_with_queueing))
@@ -714,24 +717,14 @@ void bfq_bfqq_move(struct bfq_data *bfqd, struct bfq_queue *bfqq,
  * Move bic to blkcg, assuming that bfqd->lock is held; which makes
  * sure that the reference to cgroup is valid across the call (see
  * comments in bfq_bic_update_cgroup on this issue)
- *
- * NOTE: an alternative approach might have been to store the current
- * cgroup in bfqq and getting a reference to it, reducing the lookup
- * time here, at the price of slightly more complex code.
  */
-static struct bfq_group *__bfq_bic_change_cgroup(struct bfq_data *bfqd,
-						struct bfq_io_cq *bic,
-						struct blkcg *blkcg)
+static void *__bfq_bic_change_cgroup(struct bfq_data *bfqd,
+				     struct bfq_io_cq *bic,
+				     struct bfq_group *bfqg)
 {
 	struct bfq_queue *async_bfqq = bic_to_bfqq(bic, 0);
 	struct bfq_queue *sync_bfqq = bic_to_bfqq(bic, 1);
-	struct bfq_group *bfqg;
 	struct bfq_entity *entity;
-
-	bfqg = bfq_find_set_group(bfqd, blkcg);
-
-	if (unlikely(!bfqg))
-		bfqg = bfqd->root_group;
 
 	if (async_bfqq) {
 		entity = &async_bfqq->entity;
@@ -743,9 +736,39 @@ static struct bfq_group *__bfq_bic_change_cgroup(struct bfq_data *bfqd,
 	}
 
 	if (sync_bfqq) {
-		entity = &sync_bfqq->entity;
-		if (entity->sched_data != &bfqg->sched_data)
-			bfq_bfqq_move(bfqd, sync_bfqq, bfqg);
+		if (!sync_bfqq->new_bfqq && !bfq_bfqq_coop(sync_bfqq)) {
+			/* We are the only user of this bfqq, just move it */
+			if (sync_bfqq->entity.sched_data != &bfqg->sched_data)
+				bfq_bfqq_move(bfqd, sync_bfqq, bfqg);
+		} else {
+			struct bfq_queue *bfqq;
+
+			/*
+			 * The queue was merged to a different queue. Check
+			 * that the merge chain still belongs to the same
+			 * cgroup.
+			 */
+			for (bfqq = sync_bfqq; bfqq; bfqq = bfqq->new_bfqq)
+				if (bfqq->entity.sched_data !=
+				    &bfqg->sched_data)
+					break;
+			if (bfqq) {
+				/*
+				 * Some queue changed cgroup so the merge is
+				 * not valid anymore. We cannot easily just
+				 * cancel the merge (by clearing new_bfqq) as
+				 * there may be other processes using this
+				 * queue and holding refs to all queues below
+				 * sync_bfqq->new_bfqq. Similarly if the merge
+				 * already happened, we need to detach from
+				 * bfqq now so that we cannot merge bio to a
+				 * request from the old cgroup.
+				 */
+				bfq_put_cooperator(sync_bfqq);
+				bfq_release_process_ref(bfqd, sync_bfqq);
+				bic_set_bfqq(bic, NULL, 1);
+			}
+		}
 	}
 
 	return bfqg;
@@ -754,20 +777,24 @@ static struct bfq_group *__bfq_bic_change_cgroup(struct bfq_data *bfqd,
 void bfq_bic_update_cgroup(struct bfq_io_cq *bic, struct bio *bio)
 {
 	struct bfq_data *bfqd = bic_to_bfqd(bic);
-	struct bfq_group *bfqg = NULL;
+	struct bfq_group *bfqg = bfq_bio_bfqg(bfqd, bio);
 	uint64_t serial_nr;
 
-	rcu_read_lock();
-	serial_nr = __bio_blkcg(bio)->css.serial_nr;
+	serial_nr = bfqg_to_blkg(bfqg)->blkcg->css.serial_nr;
 
 	/*
 	 * Check whether blkcg has changed.  The condition may trigger
 	 * spuriously on a newly created cic but there's no harm.
 	 */
 	if (unlikely(!bfqd) || likely(bic->blkcg_serial_nr == serial_nr))
-		goto out;
+		return;
 
-	bfqg = __bfq_bic_change_cgroup(bfqd, bic, __bio_blkcg(bio));
+	/*
+	 * New cgroup for this process. Make sure it is linked to bfq internal
+	 * cgroup hierarchy.
+	 */
+	bfq_link_bfqg(bfqd, bfqg);
+	__bfq_bic_change_cgroup(bfqd, bic, bfqg);
 	/*
 	 * Update blkg_path for bfq_log_* functions. We cache this
 	 * path, and update it here, for the following
@@ -820,72 +847,20 @@ void bfq_bic_update_cgroup(struct bfq_io_cq *bic, struct bio *bio)
 	 */
 	blkg_path(bfqg_to_blkg(bfqg), bfqg->blkg_path, sizeof(bfqg->blkg_path));
 	bic->blkcg_serial_nr = serial_nr;
-out:
-	rcu_read_unlock();
 }
 
-/**
- * bfq_flush_idle_tree - deactivate any entity on the idle tree of @st.
- * @st: the service tree being flushed.
- */
-static void bfq_flush_idle_tree(struct bfq_service_tree *st)
-{
-	struct bfq_entity *entity = st->first_idle;
-
-	for (; entity ; entity = st->first_idle)
-		__bfq_deactivate_entity(entity, false);
-}
-
-/**
- * bfq_reparent_leaf_entity - move leaf entity to the root_group.
- * @bfqd: the device data structure with the root group.
- * @entity: the entity to move, if entity is a leaf; or the parent entity
- *	    of an active leaf entity to move, if entity is not a leaf.
- */
-static void bfq_reparent_leaf_entity(struct bfq_data *bfqd,
-				     struct bfq_entity *entity,
-				     int ioprio_class)
+static void bfq_reparent_children(struct bfq_data *bfqd, struct bfq_group *bfqg)
 {
 	struct bfq_queue *bfqq;
-	struct bfq_entity *child_entity = entity;
+	struct hlist_node *next;
+	struct bfq_group *parent;
 
-	while (child_entity->my_sched_data) { /* leaf not reached yet */
-		struct bfq_sched_data *child_sd = child_entity->my_sched_data;
-		struct bfq_service_tree *child_st = child_sd->service_tree +
-			ioprio_class;
-		struct rb_root *child_active = &child_st->active;
+	parent = bfqg_parent(bfqg);
+	if (!parent)
+		parent = bfqd->root_group;
 
-		child_entity = bfq_entity_of(rb_first(child_active));
-
-		if (!child_entity)
-			child_entity = child_sd->in_service_entity;
-	}
-
-	bfqq = bfq_entity_to_bfqq(child_entity);
-	bfq_bfqq_move(bfqd, bfqq, bfqd->root_group);
-}
-
-/**
- * bfq_reparent_active_queues - move to the root group all active queues.
- * @bfqd: the device data structure with the root group.
- * @bfqg: the group to move from.
- * @st: the service tree to start the search from.
- */
-static void bfq_reparent_active_queues(struct bfq_data *bfqd,
-				       struct bfq_group *bfqg,
-				       struct bfq_service_tree *st,
-				       int ioprio_class)
-{
-	struct rb_root *active = &st->active;
-	struct bfq_entity *entity;
-
-	while ((entity = bfq_entity_of(rb_first(active))))
-		bfq_reparent_leaf_entity(bfqd, entity, ioprio_class);
-
-	if (bfqg->sched_data.in_service_entity)
-		bfq_reparent_leaf_entity(bfqd,
-					 bfqg->sched_data.in_service_entity,
-					 ioprio_class);
+	hlist_for_each_entry_safe(bfqq, next, &bfqg->children, children_node)
+		bfq_bfqq_move(bfqd, bfqq, parent);
 }
 
 /**
@@ -911,38 +886,17 @@ static void bfq_pd_offline(struct blkg_policy_data *pd)
 		goto put_async_queues;
 
 	/*
-	 * Empty all service_trees belonging to this group before
-	 * deactivating the group itself.
+	 * Reparent all bfqqs under this bfq group. This will also empty all
+	 * service_trees belonging to this group before deactivating the group
+	 * itself.
 	 */
+	bfq_reparent_children(bfqd, bfqg);
+
 	for (i = 0; i < BFQ_IOPRIO_CLASSES; i++) {
 		st = bfqg->sched_data.service_tree + i;
 
-		/*
-		 * It may happen that some queues are still active
-		 * (busy) upon group destruction (if the corresponding
-		 * processes have been forced to terminate). We move
-		 * all the leaf entities corresponding to these queues
-		 * to the root_group.
-		 * Also, it may happen that the group has an entity
-		 * in service, which is disconnected from the active
-		 * tree: it must be moved, too.
-		 * There is no need to put the sync queues, as the
-		 * scheduler has taken no reference.
-		 */
-		bfq_reparent_active_queues(bfqd, bfqg, st, i);
-
-		/*
-		 * The idle tree may still contain bfq_queues
-		 * belonging to exited task because they never
-		 * migrated to a different cgroup from the one being
-		 * destroyed now. In addition, even
-		 * bfq_reparent_active_queues() may happen to add some
-		 * entities to the idle tree. It happens if, in some
-		 * of the calls to bfq_bfqq_move() performed by
-		 * bfq_reparent_active_queues(), the queue to move is
-		 * empty and gets expired.
-		 */
-		bfq_flush_idle_tree(st);
+		WARN_ON_ONCE(!RB_EMPTY_ROOT(&st->active));
+		WARN_ON_ONCE(!RB_EMPTY_ROOT(&st->idle));
 	}
 
 	__bfq_deactivate_entity(entity, false);
@@ -1438,7 +1392,7 @@ void bfq_end_wr_async(struct bfq_data *bfqd)
 	bfq_end_wr_async_queues(bfqd, bfqd->root_group);
 }
 
-struct bfq_group *bfq_find_set_group(struct bfq_data *bfqd, struct blkcg *blkcg)
+struct bfq_group *bfq_bio_bfqg(struct bfq_data *bfqd, struct bio *bio)
 {
 	return bfqd->root_group;
 }

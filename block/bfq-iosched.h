@@ -15,7 +15,7 @@
 #define BFQ_CL_IDLE_TIMEOUT	(HZ/5)
 
 #define BFQ_MIN_WEIGHT			1
-#define BFQ_MAX_WEIGHT			1000
+#define BFQ_MAX_WEIGHT			10000
 #define BFQ_WEIGHT_CONVERSION_COEFF	10
 
 #define BFQ_DEFAULT_QUEUE_IOPRIO	4
@@ -197,9 +197,6 @@ struct bfq_entity {
 	/* flag, set to request a weight, ioprio or ioprio_class change  */
 	int prio_changed;
 
-	/* flag, set if the entity is counted in groups_with_pending_reqs */
-	bool in_groups_with_pending_reqs;
-
 	/* last child queue of entity created (for non-leaf entities) */
 	struct bfq_queue *last_bfqq_created;
 };
@@ -292,6 +289,9 @@ struct bfq_queue {
 
 	/* node for active/idle bfqq list inside parent bfqd */
 	struct list_head bfqq_list;
+	/* Member of parent's bfqg children list */
+	struct hlist_node children_node;
+
 
 	/* associated @bfq_ttime struct */
 	struct bfq_ttime ttime;
@@ -468,6 +468,7 @@ struct bfq_io_cq {
 	struct bfq_queue *stable_merge_bfqq;
 
 	bool stably_merged;	/* non splittable if true */
+	unsigned int requests;	/* Number of requests this process has in flight */
 };
 
 /**
@@ -495,52 +496,14 @@ struct bfq_data {
 	struct rb_root_cached queue_weights_tree;
 
 	/*
-	 * Number of groups with at least one descendant process that
-	 * has at least one request waiting for completion. Note that
-	 * this accounts for also requests already dispatched, but not
-	 * yet completed. Therefore this number of groups may differ
-	 * (be larger) than the number of active groups, as a group is
-	 * considered active only if its corresponding entity has
-	 * descendant queues with at least one request queued. This
-	 * number is used to decide whether a scenario is symmetric.
-	 * For a detailed explanation see comments on the computation
-	 * of the variable asymmetric_scenario in the function
-	 * bfq_better_to_idle().
-	 *
-	 * However, it is hard to compute this number exactly, for
-	 * groups with multiple descendant processes. Consider a group
-	 * that is inactive, i.e., that has no descendant process with
-	 * pending I/O inside BFQ queues. Then suppose that
-	 * num_groups_with_pending_reqs is still accounting for this
-	 * group, because the group has descendant processes with some
-	 * I/O request still in flight. num_groups_with_pending_reqs
-	 * should be decremented when the in-flight request of the
-	 * last descendant process is finally completed (assuming that
-	 * nothing else has changed for the group in the meantime, in
-	 * terms of composition of the group and active/inactive state of child
-	 * groups and processes). To accomplish this, an additional
-	 * pending-request counter must be added to entities, and must
-	 * be updated correctly. To avoid this additional field and operations,
-	 * we resort to the following tradeoff between simplicity and
-	 * accuracy: for an inactive group that is still counted in
-	 * num_groups_with_pending_reqs, we decrement
-	 * num_groups_with_pending_reqs when the first descendant
-	 * process of the group remains with no request waiting for
-	 * completion.
-	 *
-	 * Even this simpler decrement strategy requires a little
-	 * carefulness: to avoid multiple decrements, we flag a group,
-	 * more precisely an entity representing a group, as still
-	 * counted in num_groups_with_pending_reqs when it becomes
-	 * inactive. Then, when the first descendant queue of the
-	 * entity remains with no request waiting for completion,
-	 * num_groups_with_pending_reqs is decremented, and this flag
-	 * is reset. After this flag is reset for the entity,
-	 * num_groups_with_pending_reqs won't be decremented any
-	 * longer in case a new descendant queue of the entity remains
-	 * with no request waiting for completion.
+	 * Number of groups with at least one bfqq that is marked busy,
+	 * and this number is used to decide whether a scenario is symmetric.
+	 * Note that bfqq is busy doesn't mean that the bfqq contains requests.
+	 * If idling is needed for service guarantees, bfqq will stay busy
+	 * after dispatching the last request, see details in
+	 * __bfq_bfqq_expire().
 	 */
-	unsigned int num_groups_with_pending_reqs;
+	unsigned int num_groups_with_busy_queues;
 
 	/*
 	 * Per-class (RT, BE, IDLE) number of bfq_queues containing
@@ -634,7 +597,7 @@ struct bfq_data {
 	u64 tot_sectors_dispatched;
 	/* max rq size seen during current observation interval (sectors) */
 	u32 last_rq_max_size;
-	/* time elapsed from first dispatch in current observ. interval (us) */
+	/* time elapsed from first dispatch in current observ. interval (ns) */
 	u64 delta_from_first;
 	/*
 	 * Current estimate of the device peak rate, measured in
@@ -906,6 +869,7 @@ struct bfq_group_data {
  *                   are groups with more than one active @bfq_entity
  *                   (see the comments to the function
  *                   bfq_bfqq_may_idle()).
+ * @busy_queues: number of busy bfqqs.
  * @rq_pos_tree: rbtree sorted by next_request position, used when
  *               determining if two or more queues have interleaving
  *               requests (see bfq_find_close_cooperator()).
@@ -928,11 +892,16 @@ struct bfq_group {
 
 	/* reference counter (see comments in bfq_bic_update_cgroup) */
 	int ref;
+	/* Is bfq_group still online? */
+	bool online;
 
 	struct bfq_entity entity;
 	struct bfq_sched_data sched_data;
 
-	void *bfqd;
+	/* bfq_queues under this entity */
+	struct hlist_head children;
+
+	struct bfq_data *bfqd;
 
 	struct bfq_queue *async_bfqq[2][IOPRIO_NR_LEVELS];
 	struct bfq_queue *async_idle_bfqq;
@@ -940,6 +909,7 @@ struct bfq_group {
 	struct bfq_entity *my_entity;
 
 	int active_entities;
+	int busy_queues;
 
 	struct rb_root rq_pos_tree;
 
@@ -969,16 +939,12 @@ struct bfq_queue *bic_to_bfqq(struct bfq_io_cq *bic, bool is_sync);
 void bic_set_bfqq(struct bfq_io_cq *bic, struct bfq_queue *bfqq, bool is_sync);
 struct bfq_data *bic_to_bfqd(struct bfq_io_cq *bic);
 void bfq_pos_tree_add_move(struct bfq_data *bfqd, struct bfq_queue *bfqq);
-void bfq_weights_tree_add(struct bfq_data *bfqd, struct bfq_queue *bfqq,
-			  struct rb_root_cached *root);
-void __bfq_weights_tree_remove(struct bfq_data *bfqd,
-			       struct bfq_queue *bfqq,
-			       struct rb_root_cached *root);
-void bfq_weights_tree_remove(struct bfq_data *bfqd,
-			     struct bfq_queue *bfqq);
+void bfq_weights_tree_add(struct bfq_data *bfqd, struct bfq_queue *bfqq);
+void bfq_weights_tree_remove(struct bfq_data *bfqd, struct bfq_queue *bfqq);
 void bfq_bfqq_expire(struct bfq_data *bfqd, struct bfq_queue *bfqq,
 		     bool compensate, enum bfqq_expiration reason);
 void bfq_put_queue(struct bfq_queue *bfqq);
+void bfq_put_cooperator(struct bfq_queue *bfqq);
 void bfq_end_wr_async_queues(struct bfq_data *bfqd, struct bfq_group *bfqg);
 void bfq_release_process_ref(struct bfq_data *bfqd, struct bfq_queue *bfqq);
 void bfq_schedule_dispatch(struct bfq_data *bfqd);
@@ -1006,8 +972,7 @@ void bfq_bfqq_move(struct bfq_data *bfqd, struct bfq_queue *bfqq,
 void bfq_init_entity(struct bfq_entity *entity, struct bfq_group *bfqg);
 void bfq_bic_update_cgroup(struct bfq_io_cq *bic, struct bio *bio);
 void bfq_end_wr_async(struct bfq_data *bfqd);
-struct bfq_group *bfq_find_set_group(struct bfq_data *bfqd,
-				     struct blkcg *blkcg);
+struct bfq_group *bfq_bio_bfqg(struct bfq_data *bfqd, struct bio *bio);
 struct blkcg_gq *bfqg_to_blkg(struct bfq_group *bfqg);
 struct bfq_group *bfqq_group(struct bfq_queue *bfqq);
 struct bfq_group *bfq_create_group_hierarchy(struct bfq_data *bfqd, int node);
