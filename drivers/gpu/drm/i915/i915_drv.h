@@ -1389,7 +1389,7 @@ IS_SUBPLATFORM(const struct drm_i915_private *i915,
 
 #define HAS_VRR(i915)	(DISPLAY_VER(i915) >= 11)
 
-#define HAS_ASYNC_FLIPS(i915)		(DISPLAY_VER(i915) >= 5)
+#define HAS_ASYNC_FLIPS(i915)		(false)
 
 /* Only valid when HAS_DISPLAY() is true */
 #define INTEL_DISPLAY_ENABLED(dev_priv) \

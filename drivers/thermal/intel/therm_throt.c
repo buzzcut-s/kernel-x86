@@ -106,10 +106,6 @@ struct thermal_state {
 	struct _thermal_state pkg_thresh1;
 };
 
-/* Callback to handle core threshold interrupts */
-int (*platform_thermal_notify)(__u64 msr_val);
-EXPORT_SYMBOL(platform_thermal_notify);
-
 /* Callback to handle core package threshold_interrupts */
 int (*platform_thermal_package_notify)(__u64 msr_val);
 EXPORT_SYMBOL_GPL(platform_thermal_package_notify);
@@ -317,6 +313,9 @@ static void therm_throt_process(bool new_event, int event, int level)
 	bool old_event;
 	u64 now;
 	struct thermal_state *pstate = &per_cpu(thermal_state, this_cpu);
+
+	if (!IS_ENABLED(CONFIG_X86_MCE_THERMAL_VERBOSE))
+		return;
 
 	now = get_jiffies_64();
 	if (level == CORE_LEVEL) {
@@ -563,24 +562,6 @@ static void notify_package_thresholds(__u64 msr_val)
 		platform_thermal_package_notify(msr_val);
 }
 
-static void notify_thresholds(__u64 msr_val)
-{
-	/* check whether the interrupt handler is defined;
-	 * otherwise simply return
-	 */
-	if (!platform_thermal_notify)
-		return;
-
-	/* lower threshold reached */
-	if ((msr_val & THERM_LOG_THRESHOLD0) &&
-			thresh_event_valid(CORE_LEVEL, 0))
-		platform_thermal_notify(msr_val);
-	/* higher threshold reached */
-	if ((msr_val & THERM_LOG_THRESHOLD1) &&
-			thresh_event_valid(CORE_LEVEL, 1))
-		platform_thermal_notify(msr_val);
-}
-
 void __weak notify_hwp_interrupt(void)
 {
 	wrmsrl_safe(MSR_HWP_STATUS, 0);
@@ -595,9 +576,6 @@ void intel_thermal_interrupt(void)
 		notify_hwp_interrupt();
 
 	rdmsrl(MSR_IA32_THERM_STATUS, msr_val);
-
-	/* Check for violation of core thermal thresholds*/
-	notify_thresholds(msr_val);
 
 	therm_throt_process(msr_val & THERM_STATUS_PROCHOT,
 			    THERMAL_THROTTLING_EVENT,
@@ -630,6 +608,8 @@ void intel_thermal_interrupt(void)
 /* Thermal monitoring depends on APIC, ACPI and clock modulation */
 static int intel_thermal_supported(struct cpuinfo_x86 *c)
 {
+	if (!IS_ENABLED(CONFIG_X86_THERMAL_VECTOR))
+		return 0;
 	if (!boot_cpu_has(X86_FEATURE_APIC))
 		return 0;
 	if (!cpu_has(c, X86_FEATURE_ACPI) || !cpu_has(c, X86_FEATURE_ACC))

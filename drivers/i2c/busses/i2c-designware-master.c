@@ -490,8 +490,9 @@ i2c_dw_recv_len(struct dw_i2c_dev *dev, u8 len)
 	 * Adjust the buffer length and mask the flag
 	 * after receiving the first byte.
 	 */
-	len += (flags & I2C_CLIENT_PEC) ? 2 : 1;
-	dev->tx_buf_len = len - min_t(u8, len, dev->rx_outstanding);
+	if (flags & I2C_CLIENT_PEC)
+		len++;
+	dev->tx_buf_len = len - min_t(u8, len - 1, dev->rx_outstanding);
 	msgs[dev->msg_read_idx].len = len;
 	msgs[dev->msg_read_idx].flags &= ~I2C_M_RECV_LEN;
 
@@ -525,10 +526,12 @@ i2c_dw_read(struct dw_i2c_dev *dev)
 			u32 flags = msgs[dev->msg_read_idx].flags;
 
 			regmap_read(dev->map, DW_IC_DATA_CMD, &tmp);
-			/* Ensure length byte is a valid value */
-			if (flags & I2C_M_RECV_LEN &&
-			    (tmp & DW_IC_DATA_CMD_DAT) <= I2C_SMBUS_BLOCK_MAX && tmp > 0) {
-				len = i2c_dw_recv_len(dev, tmp);
+			if (flags & I2C_M_RECV_LEN) {
+				/* Ensure length byte is a valid value */
+				if (tmp > 0)
+					len = i2c_dw_recv_len(dev, tmp);
+				else
+					len = i2c_dw_recv_len(dev, len);
 			}
 			*buf++ = tmp;
 			dev->rx_outstanding--;
@@ -696,8 +699,7 @@ static u32 i2c_dw_read_clear_intrbits(struct dw_i2c_dev *dev)
 		regmap_read(dev->map, DW_IC_CLR_RX_DONE, &dummy);
 	if (stat & DW_IC_INTR_ACTIVITY)
 		regmap_read(dev->map, DW_IC_CLR_ACTIVITY, &dummy);
-	if ((stat & DW_IC_INTR_STOP_DET) &&
-	    ((dev->rx_outstanding == 0) || (stat & DW_IC_INTR_RX_FULL)))
+	if (stat & DW_IC_INTR_STOP_DET)
 		regmap_read(dev->map, DW_IC_CLR_STOP_DET, &dummy);
 	if (stat & DW_IC_INTR_START_DET)
 		regmap_read(dev->map, DW_IC_CLR_START_DET, &dummy);
@@ -719,7 +721,6 @@ static int i2c_dw_irq_handler_master(struct dw_i2c_dev *dev)
 	if (stat & DW_IC_INTR_TX_ABRT) {
 		dev->cmd_err |= DW_IC_ERR_TX_ABRT;
 		dev->status = STATUS_IDLE;
-		dev->rx_outstanding = 0;
 
 		/*
 		 * Anytime TX_ABRT is set, the contents of the tx/rx
@@ -742,8 +743,7 @@ static int i2c_dw_irq_handler_master(struct dw_i2c_dev *dev)
 	 */
 
 tx_aborted:
-	if (((stat & (DW_IC_INTR_TX_ABRT | DW_IC_INTR_STOP_DET)) || dev->msg_err) &&
-	     (dev->rx_outstanding == 0))
+	if ((stat & (DW_IC_INTR_TX_ABRT | DW_IC_INTR_STOP_DET)) || dev->msg_err)
 		complete(&dev->cmd_complete);
 	else if (unlikely(dev->flags & ACCESS_INTR_MASK)) {
 		/* Workaround to trigger pending interrupt */

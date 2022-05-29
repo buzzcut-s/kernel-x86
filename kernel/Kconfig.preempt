@@ -13,7 +13,7 @@ config PREEMPT_BUILD
 
 choice
 	prompt "Preemption Model"
-	default PREEMPT_NONE
+	default PREEMPT
 
 config PREEMPT_NONE
 	bool "No Forced Preemption (Server)"
