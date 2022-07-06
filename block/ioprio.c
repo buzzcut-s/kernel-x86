@@ -162,7 +162,7 @@ int __get_task_ioprio(struct task_struct *p)
 					 task_nice_ioprio(p));
 	return prio;
 }
-EXPORT_SYMBOL_GPL(__get_task_ioprio);
+EXPORT_SYMBOL(__get_task_ioprio);
 
 static int get_task_ioprio(struct task_struct *p)
 {
